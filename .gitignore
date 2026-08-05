@@ -1,0 +1,15 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Zig package download cache
+zig-pkg/
+
+# Test and coverage output
+coverage/
+
+# Benchmark output
+/benchmark.json
+
+# macOS
+.DS_Store

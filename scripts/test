@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FIXTURE_DIR="$ROOT/../channel"
+FIXTURE_PID=""
+STARTED_FIXTURE=0
+
+cleanup() {
+  if [[ "$STARTED_FIXTURE" -eq 1 && -n "$FIXTURE_PID" ]]; then
+    kill "$FIXTURE_PID" >/dev/null 2>&1 || true
+    wait "$FIXTURE_PID" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+wait_for_port() {
+  local host="$1"
+  local port="$2"
+  local timeout_ms="$3"
+  local elapsed=0
+  while (( elapsed < timeout_ms )); do
+    if nc -z "$host" "$port" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.05
+    elapsed=$((elapsed + 50))
+  done
+  return 1
+}
+
+start_fixture_if_needed() {
+  if pgrep -f "$FIXTURE_DIR/tests/server.ts" >/dev/null 2>&1; then
+    echo "Using existing fixture server on 127.0.0.1:2049"
+    return 0
+  fi
+  echo "Starting fixture server: $FIXTURE_DIR/tests/server.ts"
+  (
+    cd "$FIXTURE_DIR"
+    bun tests/server.ts
+  ) >"$ROOT/coverage/fixture-test.log" 2>&1 &
+  FIXTURE_PID=$!
+  STARTED_FIXTURE=1
+  if ! wait_for_port 127.0.0.1 2049 10000; then
+    echo "Fixture server failed to start. Log:"
+    tail -n 200 "$ROOT/coverage/fixture-test.log" || true
+    exit 1
+  fi
+}
+
+cd "$ROOT"
+start_fixture_if_needed
+
+zig build test-unit
+zig build test-integration
+
+echo "All channel-zig tests passed."
