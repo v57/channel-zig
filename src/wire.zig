@@ -42,7 +42,13 @@ pub const OutgoingMessage = struct {
     done: ?bool = null,
 };
 
+/// Maximum JSON nesting accepted in an incoming message. `body`/`context` are re-serialized with
+/// `std.json.Stringify`, whose nesting stack is fixed-size (256 levels) and panics when exceeded,
+/// so deeper input is rejected up front (AUDIT2 "deepjson": 100k-deep JSON crashed the client).
+pub const max_nesting_depth: usize = 128;
+
 pub fn parseMessagesAlloc(allocator: Allocator, raw: []const u8) ![]ParsedMessage {
+    if (nestingDepthExceeds(raw, max_nesting_depth)) return error.JsonTooDeep;
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
 
@@ -109,7 +115,13 @@ fn parseOneAlloc(allocator: Allocator, value: std.json.Value) !ParsedMessage {
         message.context_json = try stringifyValueAlloc(allocator, field);
     }
     if (object.get("error")) |field| {
-        message.error_text = try dupeStringField(allocator, field);
+        // Peers are expected to send a string, but a hostile or non-conforming peer may send an
+        // object/number. Surface it as an error (its JSON text) instead of rejecting the frame.
+        message.error_text = switch (field) {
+            .null => null,
+            .string => |string| try allocator.dupe(u8, string),
+            else => try stringifyValueAlloc(allocator, field),
+        };
     }
     if (object.get("done")) |field| {
         message.done = switch (field) {
@@ -226,4 +238,39 @@ fn freeOptional(allocator: Allocator, slot: *?[]u8) void {
 
 fn jsonStringifyAlloc(allocator: Allocator, value: anytype) ![]u8 {
     return try std.json.Stringify.valueAlloc(allocator, value, .{});
+}
+
+/// True when `raw` nests arrays/objects deeper than `limit` (brackets inside strings ignored).
+pub fn nestingDepthExceeds(raw: []const u8, limit: usize) bool {
+    var depth: usize = 0;
+    var in_string = false;
+    var escaped = false;
+    for (raw) |byte| {
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (byte == '\\') {
+                escaped = true;
+            } else if (byte == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        switch (byte) {
+            '"' => in_string = true,
+            '[', '{' => {
+                depth += 1;
+                if (depth > limit) return true;
+            },
+            ']', '}' => depth -|= 1,
+            else => {},
+        }
+    }
+    return false;
+}
+
+test "nesting depth guard" {
+    try std.testing.expect(!nestingDepthExceeds("{\"a\":[1,{\"b\":\"[[[[\"}]}", 2));
+    try std.testing.expect(nestingDepthExceeds("[[[1]]]", 2));
+    try std.testing.expect(!nestingDepthExceeds("[\"\\\"[[[\"]", 1));
 }

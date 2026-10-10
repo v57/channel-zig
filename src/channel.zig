@@ -304,8 +304,17 @@ pub fn Subscription(comptime Req: type, comptime Event: type) type {
         owned_prefix: ?[]u8 = null,
         publishers: std.ArrayListUnmanaged(PublisherSlot) = .{},
         next_publisher_id: usize = 1,
+        /// Custom topic formatter (TS `Subscription.topic(make)`). Called with a scratch arena; the
+        /// returned slice is copied, so it may point into the arena or static memory.
+        topic_fn: ?TopicFn = null,
+        /// Custom body formatter (TS `Subscription.body(make)`): its value is returned in the
+        /// subscribe ack and used by `sendDefault` / a null `send` event. Called with a scratch
+        /// arena; the result is encoded before the arena is freed.
+        body_fn: ?BodyFn = null,
 
         const Self = @This();
+        pub const TopicFn = *const fn (allocator: Allocator, request: Req) anyerror![]const u8;
+        pub const BodyFn = *const fn (allocator: Allocator, request: Req) anyerror!?Event;
 
         const PublisherSlot = struct {
             id: usize,
@@ -323,15 +332,62 @@ pub fn Subscription(comptime Req: type, comptime Event: type) type {
             self.* = .{};
         }
 
+        /// Sets the topic formatter (TS `topic(make)`).
+        pub fn topic(self: *Self, make: TopicFn) *Self {
+            self.topic_fn = make;
+            return self;
+        }
+
+        /// Sets the body formatter (TS `body(make)`; TS commit 6d42247: it sets the body, never
+        /// the topic).
+        pub fn body(self: *Self, make: BodyFn) *Self {
+            self.body_fn = make;
+            return self;
+        }
+
+        /// Publishes `event` to subscribers of `request`'s topic. Like TS `publish`, falsy bodies
+        /// (null, false, 0, "") are not sent. A null `event` (optional Event) falls back to the
+        /// body formatter, like TS `body ?? this._body(request)`.
         pub fn send(self: *Self, allocator: Allocator, request: Req, event: Event) !void {
-            const local_topic = try topicFromValueAlloc(allocator, Req, request);
-            defer allocator.free(local_topic);
-            const topic = try joinTopicAlloc(allocator, self.prefix, local_topic);
-            defer allocator.free(topic);
+            if (comptime json_codec.isOptionalType(Event)) {
+                if (event == null) return self.sendDefault(allocator, request);
+            }
             const body_json = try json_codec.encodeOptionalAlloc(allocator, Event, event);
             defer if (body_json) |value| allocator.free(value);
-            if (Event == void and body_json == null) return;
-            self.publishEncoded(topic, body_json);
+            try self.publishJson(allocator, request, body_json);
+        }
+
+        /// Publishes the body formatter's value for `request` (TS `send(request)` with no body).
+        pub fn sendDefault(self: *Self, allocator: Allocator, request: Req) !void {
+            const body_json = try self.defaultBodyJson(allocator, request);
+            defer if (body_json) |value| allocator.free(value);
+            try self.publishJson(allocator, request, body_json);
+        }
+
+        fn publishJson(self: *Self, allocator: Allocator, request: Req, body_json: ?[]const u8) !void {
+            if (isFalsyJson(body_json)) return;
+            const topic_value = try self.topicAlloc(allocator, request);
+            defer allocator.free(topic_value);
+            self.publishEncoded(topic_value, body_json);
+        }
+
+        fn topicAlloc(self: *Self, allocator: Allocator, request: Req) ![]u8 {
+            const local_topic = if (self.topic_fn) |make| blk: {
+                var arena = std.heap.ArenaAllocator.init(allocator);
+                defer arena.deinit();
+                break :blk try allocator.dupe(u8, try make(arena.allocator(), request));
+            } else try topicFromValueAlloc(allocator, Req, request);
+            defer allocator.free(local_topic);
+            return joinTopicAlloc(allocator, self.prefix, local_topic);
+        }
+
+        fn defaultBodyJson(self: *Self, allocator: Allocator, request: Req) !?[]u8 {
+            const make = self.body_fn orelse return null;
+            if (Event == void) return null;
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const value = (try make(arena.allocator(), request)) orelse return null;
+            return try json_codec.encodeOptionalAlloc(allocator, Event, value);
         }
 
         fn erased(self: *Self) SubscriptionBinding {
@@ -348,10 +404,11 @@ pub fn Subscription(comptime Req: type, comptime Event: type) type {
             const self: *Self = @ptrCast(@alignCast(ptr));
             var request = try json_codec.decodeRequired(allocator, Req, body_json);
             defer json_codec.freeOwnedValue(allocator, Req, &request);
-            const local_topic = try topicFromValueAlloc(allocator, Req, request);
-            defer allocator.free(local_topic);
+            const topic_value = try self.topicAlloc(allocator, request);
+            errdefer allocator.free(topic_value);
             return .{
-                .topic = try joinTopicAlloc(allocator, self.prefix, local_topic),
+                .topic = topic_value,
+                .body_json = try self.defaultBodyJson(allocator, request),
             };
         }
 
@@ -391,7 +448,7 @@ pub fn Subscription(comptime Req: type, comptime Event: type) type {
             self.prefix = self.owned_prefix.?;
         }
 
-        fn publishEncoded(self: *Self, topic: []const u8, body_json: ?[]const u8) void {
+        fn publishEncoded(self: *Self, event_topic: []const u8, body_json: ?[]const u8) void {
             const allocator = self.allocator;
             const publisher_count = self.publishers.items.len;
             if (publisher_count == 0) {
@@ -407,7 +464,7 @@ pub fn Subscription(comptime Req: type, comptime Event: type) type {
             defer allocator.?.free(copy.?);
 
             for (copy.?) |sink| {
-                sink.send(sink.ptr, topic, body_json);
+                sink.send(sink.ptr, event_topic, body_json);
             }
         }
     };
@@ -952,7 +1009,7 @@ pub fn Channel(comptime State: type) type {
                 if (message.id) |id| {
                     try peer.sendMessage(.{
                         .id = id,
-                        .error_text = try self.allocator.dupe(u8, "api not found"),
+                        .error_text = try peer.allocator.dupe(u8, "api not found"),
                     });
                 }
                 return;
@@ -972,7 +1029,7 @@ pub fn Channel(comptime State: type) type {
                 }
                 try peer.sendMessage(.{
                     .id = message.id.?,
-                    .error_text = try self.allocator.dupe(u8, "api not found"),
+                    .error_text = try peer.allocator.dupe(u8, "api not found"),
                 });
                 return;
             }
@@ -987,17 +1044,19 @@ pub fn Channel(comptime State: type) type {
                 const binding = self.subscriptions.get(name) orelse {
                     try peer.sendMessage(.{
                         .id = id,
-                        .error_text = try self.allocator.dupe(u8, "subscription not found"),
+                        .error_text = try peer.allocator.dupe(u8, "subscription not found"),
                     });
                     return;
                 };
-                var ack = try binding.subscribe(binding.ptr, self.allocator, message.body_json);
+                var ack = binding.subscribe(binding.ptr, self.allocator, message.body_json) catch |err| {
+                    return peer.replyError(id, err);
+                };
                 defer ack.deinit(self.allocator);
                 peer.addRemoteTopic(ack.topic);
                 try peer.sendMessage(.{
                     .id = id,
-                    .topic = try self.allocator.dupe(u8, ack.topic),
-                    .body_json = if (ack.body_json) |value| try self.allocator.dupe(u8, value) else null,
+                    .topic = try peer.allocator.dupe(u8, ack.topic),
+                    .body_json = if (ack.body_json) |value| try peer.allocator.dupe(u8, value) else null,
                 });
                 return;
             }
@@ -1063,9 +1122,9 @@ pub fn Channel(comptime State: type) type {
             inline for (info.fields) |field| {
                 const value_ptr = &@field(spec.*, field.name);
                 const FieldType = @TypeOf(value_ptr.*);
+                try self.owned_strings.ensureUnusedCapacity(self.allocator, 1);
                 const next_prefix = try joinTopicAlloc(self.allocator, prefix, field.name);
-                errdefer self.allocator.free(next_prefix);
-                try self.owned_strings.append(self.allocator, next_prefix);
+                self.owned_strings.appendAssumeCapacity(next_prefix);
                 if (@hasDecl(FieldType, "__channel_subscription_marker")) {
                     const binding = value_ptr.erased();
                     try binding.set_prefix(binding.ptr, self.allocator, next_prefix);
@@ -1177,9 +1236,17 @@ pub fn Channel(comptime State: type) type {
                     context_json: ?[]const u8,
                     id: ?i64,
                 ) !void {
-                    var body = try json_codec.decodeRequired(channel.allocator, Req, body_json);
+                    // An undecodable request is answered with an error (TS replies with the thrown
+                    // error) instead of tearing down the whole connection.
+                    var body = json_codec.decodeRequired(channel.allocator, Req, body_json) catch |err| {
+                        if (id) |request_id| return peer.replyError(request_id, err);
+                        return;
+                    };
                     defer json_codec.freeOwnedValue(channel.allocator, Req, &body);
-                    var context = try json_codec.decodeRequired(channel.allocator, Ctx, context_json);
+                    var context = json_codec.decodeRequired(channel.allocator, Ctx, context_json) catch |err| {
+                        if (id) |request_id| return peer.replyError(request_id, err);
+                        return;
+                    };
                     defer json_codec.freeOwnedValue(channel.allocator, Ctx, &context);
                     const result = handler(PostRequest(State, Req, Ctx){
                         .body = body,
@@ -1191,7 +1258,7 @@ pub fn Channel(comptime State: type) type {
                         if (id) |request_id| {
                             try peer.sendMessage(.{
                                 .id = request_id,
-                                .error_text = try std.fmt.allocPrint(channel.allocator, "{s}", .{@errorName(err)}),
+                                .error_text = try peer.allocator.dupe(u8, @errorName(err)),
                             });
                         }
                         return;
@@ -1201,11 +1268,11 @@ pub fn Channel(comptime State: type) type {
                             null
                         else
                             try json_codec.encodeOptionalAlloc(
-                                channel.allocator,
+                                peer.allocator,
                                 ?Resp,
                                 normalizePostResult(Resp, result),
                             );
-                        errdefer if (body_out) |value| channel.allocator.free(value);
+                        // `sendMessage` owns `body_out` from here on, on success and on error.
                         try peer.sendMessage(.{
                             .id = request_id,
                             .body_json = body_out,
@@ -1231,20 +1298,21 @@ pub fn Channel(comptime State: type) type {
                     id: ?i64,
                 ) !void {
                     const request_id = id orelse return;
-                    var body = try json_codec.decodeRequired(channel.allocator, Req, body_json);
-                    errdefer json_codec.freeOwnedValue(channel.allocator, Req, &body);
-                    var context = try json_codec.decodeRequired(channel.allocator, Ctx, context_json);
-                    errdefer json_codec.freeOwnedValue(channel.allocator, Ctx, &context);
+                    // Each resource is released by exactly one defer (an errdefer next to a defer for
+                    // the same value double-frees when a later `try` fails).
+                    var body = json_codec.decodeRequired(channel.allocator, Req, body_json) catch |err| {
+                        return peer.replyError(request_id, err);
+                    };
+                    defer json_codec.freeOwnedValue(channel.allocator, Req, &body);
+                    var context = json_codec.decodeRequired(channel.allocator, Ctx, context_json) catch |err| {
+                        return peer.replyError(request_id, err);
+                    };
+                    defer json_codec.freeOwnedValue(channel.allocator, Ctx, &context);
                     const owned_path = try channel.allocator.dupe(u8, path);
-                    errdefer channel.allocator.free(owned_path);
+                    defer channel.allocator.free(owned_path);
 
                     const task = try peer.createIncomingStreamTask(request_id);
-                    errdefer peer.releaseIncomingStreamTask(request_id);
-
                     defer peer.releaseIncomingStreamTask(request_id);
-                    defer channel.allocator.free(owned_path);
-                    defer json_codec.freeOwnedValue(channel.allocator, Req, &body);
-                    defer json_codec.freeOwnedValue(channel.allocator, Ctx, &context);
 
                     var emitter_state = TypedEmitterState(State, Item){
                         .peer = peer,
@@ -1265,7 +1333,7 @@ pub fn Channel(comptime State: type) type {
                     }) catch |err| {
                         try peer.sendMessage(.{
                             .id = task.id,
-                            .error_text = try std.fmt.allocPrint(channel.allocator, "{s}", .{@errorName(err)}),
+                            .error_text = try peer.allocator.dupe(u8, @errorName(err)),
                         });
                         return;
                     };
@@ -1299,6 +1367,8 @@ fn Peer(comptime State: type) type {
 
         publishers: std.ArrayListUnmanaged(PublisherRegistration) = .{},
         stopped: bool = false,
+        /// Error text pending calls/streams/subscriptions settle with when this peer stops.
+        stop_reason: []const u8 = "disconnected",
 
         const Self = @This();
 
@@ -1433,6 +1503,13 @@ fn Peer(comptime State: type) type {
             self.allocator.destroy(self);
         }
 
+        /// Stops the peer and settles every pending call with `reason` (a static string).
+        fn stopWithReason(self: *Self, reason: []const u8) void {
+            if (self.stopped) return;
+            self.stop_reason = reason;
+            self.stop();
+        }
+
         pub fn stop(self: *Self) void {
             if (self.stopped) return;
             self.stopped = true;
@@ -1465,48 +1542,36 @@ fn Peer(comptime State: type) type {
             body: Req,
             context: Ctx,
         ) !CallResult(Resp) {
+            // Ownership: `pending` (and whatever reply buffers it collects) is released exactly once, by
+            // the single defer below. The request buffers move into `sendMessage`, which always frees
+            // them, so nothing here may free them again (AUDIT2 §1.1: double free on any later error).
             const pending = try self.allocator.create(PendingCall);
-            errdefer self.allocator.destroy(pending);
             pending.* = .{};
-
             const id = self.takeNextId();
-            try self.pending.put(self.allocator, id, .{ .call = pending });
-            errdefer {
-                _ = self.pending.remove(id);
+            self.pending.put(self.allocator, id, .{ .call = pending }) catch |err| {
                 self.allocator.destroy(pending);
-            }
-
-            const body_json = try json_codec.encodeOptionalAlloc(self.allocator, Req, body);
-            errdefer if (body_json) |value| self.allocator.free(value);
-            const context_json = try json_codec.encodeOptionalAlloc(self.allocator, Ctx, context);
-            errdefer if (context_json) |value| self.allocator.free(value);
-            try self.sendMessage(.{
-                .id = id,
-                .path = try self.allocator.dupe(u8, path),
-                .body_json = body_json,
-                .context_json = context_json,
-            });
-
-            while (!pending.done and !self.stopped) {
-                if (!(try pumpAll())) {
-                    std.Thread.sleep(100_000);
-                }
-            }
-            const error_text = pending.error_text;
-            const response_body = pending.body_json;
+                return err;
+            };
             defer {
-                if (error_text) |value| self.allocator.free(value);
-                if (response_body) |value| self.allocator.free(value);
+                _ = self.pending.remove(id);
+                if (pending.error_text) |value| self.allocator.free(value);
+                if (pending.body_json) |value| self.allocator.free(value);
                 self.allocator.destroy(pending);
             }
 
-            if (error_text) |value| {
+            const message = try self.buildRequest(id, .path, path, Req, body, Ctx, context);
+            try self.sendMessage(message);
+
+            try self.waitUntil(&pending.done);
+            if (!pending.done) return error.NotConnected;
+
+            if (pending.error_text) |value| {
                 return .{ .remote_err = try allocator.dupe(u8, value) };
             }
-            if (Resp == void or response_body == null) {
+            if (Resp == void or pending.body_json == null) {
                 return .{ .ok = null };
             }
-            const decoded = try json_codec.decodeRequired(allocator, Resp, response_body);
+            const decoded = try json_codec.decodeRequired(allocator, Resp, pending.body_json);
             return .{ .ok = decoded };
         }
 
@@ -1519,32 +1584,26 @@ fn Peer(comptime State: type) type {
             body: Req,
             context: Ctx,
         ) !Values(Item) {
-            var pending = try self.allocator.create(PendingStream);
-            errdefer self.allocator.destroy(pending);
+            const pending = try self.allocator.create(PendingStream);
             const id = self.takeNextId();
             pending.* = .{
                 .peer = self,
                 .id = id,
             };
-            try self.stream_entries.append(self.allocator, pending);
-
-            try self.pending.put(self.allocator, id, .{ .stream = pending });
             errdefer {
-                _ = self.pending.remove(id);
                 pending.deinit(self.allocator);
                 self.allocator.destroy(pending);
             }
+            // `stream_entries` owns the stream once appended; reserve now so the append can't fail
+            // after the request is on the wire.
+            try self.stream_entries.ensureUnusedCapacity(self.allocator, 1);
+            try self.pending.put(self.allocator, id, .{ .stream = pending });
+            errdefer _ = self.pending.remove(id);
 
-            const body_json = try json_codec.encodeOptionalAlloc(self.allocator, Req, body);
-            errdefer if (body_json) |value| self.allocator.free(value);
-            const context_json = try json_codec.encodeOptionalAlloc(self.allocator, Ctx, context);
-            errdefer if (context_json) |value| self.allocator.free(value);
-            try self.sendMessage(.{
-                .id = id,
-                .stream = try self.allocator.dupe(u8, path),
-                .body_json = body_json,
-                .context_json = context_json,
-            });
+            // `sendMessage` takes ownership of the request buffers (see sendTyped).
+            const message = try self.buildRequest(id, .stream, path, Req, body, Ctx, context);
+            try self.sendMessage(message);
+            self.stream_entries.appendAssumeCapacity(pending);
 
             return .{
                 .ptr = pending,
@@ -1575,45 +1634,31 @@ fn Peer(comptime State: type) type {
             user_data: ?*anyopaque,
             comptime callback: *const fn (?*anyopaque, Event) void,
         ) !SubscribeResult {
+            // Same single-owner scheme as sendTyped.
             const pending = try self.allocator.create(PendingSubscribe);
-            errdefer self.allocator.destroy(pending);
             pending.* = .{};
-
             const id = self.takeNextId();
-            try self.pending.put(self.allocator, id, .{ .subscribe = pending });
-            errdefer {
-                _ = self.pending.remove(id);
+            self.pending.put(self.allocator, id, .{ .subscribe = pending }) catch |err| {
                 self.allocator.destroy(pending);
-            }
-
-            const body_json = try json_codec.encodeOptionalAlloc(self.allocator, Req, body);
-            errdefer if (body_json) |value| self.allocator.free(value);
-            const context_json = try json_codec.encodeOptionalAlloc(self.allocator, Ctx, context);
-            errdefer if (context_json) |value| self.allocator.free(value);
-            try self.sendMessage(.{
-                .id = id,
-                .sub = try self.allocator.dupe(u8, path),
-                .body_json = body_json,
-                .context_json = context_json,
-            });
-
-            while (!pending.done and !self.stopped) {
-                if (!(try pumpAll())) {
-                    std.Thread.sleep(100_000);
-                }
-            }
-            const error_text = pending.error_text;
-            const topic = pending.topic;
+                return err;
+            };
             defer {
-                if (error_text) |value| self.allocator.free(value);
-                if (topic) |value| self.allocator.free(value);
+                _ = self.pending.remove(id);
+                if (pending.error_text) |value| self.allocator.free(value);
+                if (pending.topic) |value| self.allocator.free(value);
                 self.allocator.destroy(pending);
             }
 
-            if (error_text) |value| {
+            const message = try self.buildRequest(id, .sub, path, Req, body, Ctx, context);
+            try self.sendMessage(message);
+
+            try self.waitUntil(&pending.done);
+            if (!pending.done) return error.NotConnected;
+
+            if (pending.error_text) |value| {
                 return .{ .remote_err = try allocator.dupe(u8, value) };
             }
-            const topic_value = topic orelse return .{ .remote_err = try allocator.dupe(u8, "subscription missing topic") };
+            const topic_value = pending.topic orelse return .{ .remote_err = try allocator.dupe(u8, "subscription missing topic") };
             const entry = try self.allocator.create(TopicCallbackEntry);
             entry.* = .{
                 .peer = self,
@@ -1643,6 +1688,51 @@ fn Peer(comptime State: type) type {
                     .cancel_fn = TopicCallbackEntry.cancel,
                 },
             };
+        }
+
+        fn replyError(self: *Self, id: i64, err: anyerror) !void {
+            try self.sendMessage(.{
+                .id = id,
+                .error_text = try self.allocator.dupe(u8, @errorName(err)),
+            });
+        }
+
+        const RequestKind = enum { path, stream, sub };
+
+        /// Builds an outgoing request. On error nothing is leaked; on success the caller must hand
+        /// the message to `sendMessage` (which always frees it) and must not free its fields itself.
+        fn buildRequest(
+            self: *Self,
+            id: i64,
+            comptime kind: RequestKind,
+            path: []const u8,
+            comptime Req: type,
+            body: Req,
+            comptime Ctx: type,
+            context: Ctx,
+        ) !OwnedMessage {
+            var message = OwnedMessage{ .id = id };
+            errdefer message.deinit(self.allocator);
+            message.body_json = try json_codec.encodeOptionalAlloc(self.allocator, Req, body);
+            message.context_json = try json_codec.encodeOptionalAlloc(self.allocator, Ctx, context);
+            const owned_path = try self.allocator.dupe(u8, path);
+            switch (kind) {
+                .path => message.path = owned_path,
+                .stream => message.stream = owned_path,
+                .sub => message.sub = owned_path,
+            }
+            return message;
+        }
+
+        /// Pumps every transport until `flag` is set or this peer stops. Transport errors are
+        /// contained by the transports themselves (they stop the affected peer, which settles its
+        /// pending calls), so a hostile frame on another connection can't abort this wait.
+        fn waitUntil(self: *Self, flag: *const bool) !void {
+            while (!flag.* and !self.stopped) {
+                if (!(try pumpAll())) {
+                    std.Thread.sleep(100_000);
+                }
+            }
         }
 
         fn takeNextId(self: *Self) i64 {
@@ -1853,21 +1943,21 @@ fn Peer(comptime State: type) type {
                 switch (entry.value_ptr.*) {
                     .call => |call| {
                         if (!call.done) {
-                            call.error_text = self.allocator.dupe(u8, "disconnected") catch null;
+                            call.error_text = self.allocator.dupe(u8, self.stop_reason) catch null;
                             call.done = true;
                         }
                     },
                     .stream => |stream| {
                         if (!stream.finished) {
                             stream.queue.append(self.allocator, .{
-                                .error_text = self.allocator.dupe(u8, "disconnected") catch null,
+                                .error_text = self.allocator.dupe(u8, self.stop_reason) catch null,
                             }) catch {};
                             stream.finished = true;
                         }
                     },
                     .subscribe => |sub| {
                         if (!sub.done) {
-                            sub.error_text = self.allocator.dupe(u8, "disconnected") catch null;
+                            sub.error_text = self.allocator.dupe(u8, self.stop_reason) catch null;
                             sub.done = true;
                         }
                     },
@@ -1921,10 +2011,15 @@ fn Peer(comptime State: type) type {
         fn publisherSend(raw_ptr: *anyopaque, topic: []const u8, body_json: ?[]const u8) void {
             const self: *Self = @ptrCast(@alignCast(raw_ptr));
             if (!self.isRemoteSubscribed(topic)) return;
-            self.sendMessage(.{
-                .topic = self.allocator.dupe(u8, topic) catch return,
-                .body_json = if (body_json) |value| self.allocator.dupe(u8, value) catch return else null,
-            }) catch {};
+            var message = OwnedMessage{};
+            message.topic = self.allocator.dupe(u8, topic) catch return;
+            if (body_json) |value| {
+                message.body_json = self.allocator.dupe(u8, value) catch {
+                    message.deinit(self.allocator);
+                    return;
+                };
+            }
+            self.sendMessage(message) catch {};
         }
 
         fn processSendFrame(raw_ptr: *anyopaque, payload: []u8) !void {
@@ -1958,9 +2053,10 @@ fn TypedEmitterState(comptime State: type, comptime Item: type) type {
 
         fn emit(raw_ptr: *anyopaque, allocator: Allocator, item: Item) !void {
             const self: *@This() = @ptrCast(@alignCast(raw_ptr));
+            _ = allocator;
             if (self.task.cancelled) return error.Cancelled;
-            const body_json = try json_codec.encodeOptionalAlloc(allocator, Item, item);
-            errdefer if (body_json) |value| allocator.free(value);
+            // Encoded with the peer's allocator: `sendMessage` takes ownership and frees it with that.
+            const body_json = try json_codec.encodeOptionalAlloc(self.peer.allocator, Item, item);
             try self.peer.sendMessage(.{
                 .id = self.task.id,
                 .body_json = body_json,
@@ -2021,7 +2117,7 @@ fn ClientTransport(comptime State: type) type {
             var buffer_provider = try websocket.buffer.Provider.init(allocator, .{
                 .size = 0,
                 .count = 0,
-                .max = 65_536,
+                .max = max_frame_buffer,
             });
             errdefer buffer_provider.deinit();
 
@@ -2092,12 +2188,24 @@ fn ClientTransport(comptime State: type) type {
             return self.poll();
         }
 
+        /// Errors are contained here: anything the server sends that we can't handle (oversized or
+        /// malformed frames, undecodable JSON, socket errors) stops this client's peer, which settles
+        /// its pending calls with an error. Nothing propagates into `pumpAll`, so one hostile
+        /// connection can't abort a wait on another one.
         fn poll(self: *Self) !bool {
             if (!self.connected) return false;
             var progressed = false;
 
             while (true) {
-                if (try self.reader.read()) |result| {
+                guardFrameLengths(&self.reader, max_message_size) catch {
+                    self.fail("message too large");
+                    return true;
+                };
+                const maybe_result = self.reader.read() catch {
+                    self.fail("invalid websocket frame");
+                    return true;
+                };
+                if (maybe_result) |result| {
                     progressed = true;
                     const message = result[1];
                     defer self.reader.done(message.type);
@@ -2109,12 +2217,14 @@ fn ClientTransport(comptime State: type) type {
                                 else => unreachable,
                             };
                             self.peer.handleIncomingFrame(message.data, kind) catch {
-                                self.connected = false;
-                                self.peer.stop();
-                                return error.InvalidJsonMessage;
+                                self.fail("invalid message");
+                                return true;
                             };
                         },
-                        .ping => try writeClientSocketFrame(self.stream.handle, .pong, message.data),
+                        .ping => writeClientSocketFrame(self.stream.handle, .pong, message.data) catch {
+                            self.fail("disconnected");
+                            return true;
+                        },
                         .pong => {},
                         .close => {
                             closeErased(self);
@@ -2122,24 +2232,24 @@ fn ClientTransport(comptime State: type) type {
                             return true;
                         },
                     }
+                    if (!self.connected) return true;
                     continue;
                 }
 
                 self.reader.fill(&self.stream) catch |err| switch (err) {
                     error.WouldBlock => return progressed,
-                    error.Closed, error.ConnectionResetByPeer, error.BrokenPipe => {
-                        self.connected = false;
-                        self.peer.stop();
-                        return true;
-                    },
                     else => {
-                        self.connected = false;
-                        self.peer.stop();
-                        return err;
+                        self.fail("disconnected");
+                        return true;
                     },
                 };
                 progressed = true;
             }
+        }
+
+        fn fail(self: *Self, reason: []const u8) void {
+            closeErased(self);
+            self.peer.stopWithReason(reason);
         }
 
         fn performHandshake(self: *Self, port: u16, headers: ?[]const u8) !usize {
@@ -2157,6 +2267,8 @@ fn ClientTransport(comptime State: type) type {
                 port,
             })).len;
             if (headers) |extra_headers| {
+                // + 4 for the optional "\r\n" after the headers and the final "\r\n".
+                if (pos + extra_headers.len + 4 > request_buf.len) return error.HeadersTooLarge;
                 if (extra_headers.len > 0) {
                     @memcpy(request_buf[pos .. pos + extra_headers.len], extra_headers);
                     pos += extra_headers.len;
@@ -2425,7 +2537,15 @@ fn ServerTransport(comptime State: type) type {
                 var stream = net.Stream{ .handle = self.socket };
 
                 while (true) {
-                    if (try reader.read()) |result| {
+                    guardFrameLengths(reader, max_message_size) catch {
+                        self.destroy();
+                        return true;
+                    };
+                    const maybe_result = reader.read() catch {
+                        self.destroy();
+                        return true;
+                    };
+                    if (maybe_result) |result| {
                         progressed = true;
                         const message = result[1];
                         defer reader.done(message.type);
@@ -2441,7 +2561,10 @@ fn ServerTransport(comptime State: type) type {
                                     return true;
                                 };
                             },
-                            .ping => try writeSocketFrame(self.socket, .pong, message.data),
+                            .ping => writeSocketFrame(self.socket, .pong, message.data) catch {
+                                self.destroy();
+                                return true;
+                            },
                             .pong => {},
                             .close => {
                                 self.destroy();
@@ -2453,13 +2576,9 @@ fn ServerTransport(comptime State: type) type {
 
                     reader.fill(&stream) catch |err| switch (err) {
                         error.WouldBlock => return progressed,
-                        error.Closed, error.ConnectionResetByPeer, error.BrokenPipe => {
-                            self.destroy();
-                            return true;
-                        },
                         else => {
                             self.destroy();
-                            return err;
+                            return true;
                         },
                     };
                     progressed = true;
@@ -2504,7 +2623,7 @@ fn ServerTransport(comptime State: type) type {
                 .buffer_provider = try websocket.buffer.Provider.init(allocator, .{
                     .size = 0,
                     .count = 0,
-                    .max = 65_536,
+                    .max = max_frame_buffer,
                 }),
             };
             errdefer self.handshake_pool.deinit();
@@ -2542,20 +2661,35 @@ fn ServerTransport(comptime State: type) type {
             while (true) {
                 var address: net.Address = undefined;
                 var address_len: posix.socklen_t = @sizeOf(net.Address);
-                const socket = posix.accept(self.listener, &address.any, &address_len, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch |err| switch (err) {
-                    error.WouldBlock => break,
-                    else => return err,
+                // Accept errors (EMFILE, ECONNABORTED, ...) are per-connection: try again next poll.
+                const socket = posix.accept(self.listener, &address.any, &address_len, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch break;
+                const conn = Connection.create(self.allocator, self, socket, address) catch {
+                    posix.close(socket);
+                    break;
                 };
-                const conn = try Connection.create(self.allocator, self, socket, address);
-                try self.connections.append(self.allocator, conn);
+                self.connections.append(self.allocator, conn) catch {
+                    conn.removed = true; // not in the list yet; skip removeConnection
+                    conn.closeSocket();
+                    if (conn.handshake_state) |state| state.release();
+                    self.allocator.destroy(conn);
+                    break;
+                };
                 progressed = true;
             }
 
             var index: usize = 0;
             while (index < self.connections.items.len) {
                 const conn = self.connections.items[index];
-                progressed = (try conn.poll()) or progressed;
-                if (!conn.removed) {
+                // A failing connection is torn down on its own; it never aborts the server poll.
+                // `conn` may be freed by `poll`, so check list membership instead of `conn.removed`.
+                const polled = conn.poll() catch blk: {
+                    if (index < self.connections.items.len and self.connections.items[index] == conn) {
+                        conn.destroy();
+                    }
+                    break :blk true;
+                };
+                progressed = polled or progressed;
+                if (index < self.connections.items.len and self.connections.items[index] == conn) {
                     index += 1;
                 }
             }
@@ -2583,6 +2717,47 @@ fn ServerTransport(comptime State: type) type {
             allocator.destroy(self);
         }
     };
+}
+
+/// Largest message (single frame payload or reassembled fragments) accepted from a peer. Matches
+/// the TS/Bun default max payload (16 MiB). Larger messages close the connection.
+pub const max_message_size: usize = 16 * 1024 * 1024;
+/// Buffer cap handed to the websocket package: a whole frame (payload + up to 14 header bytes).
+const max_frame_buffer: usize = max_message_size + 14;
+
+/// Validates the length of every frame header already buffered in `reader` before the websocket
+/// package parses it. The package computes `payload_len + header_len` in u64 without an overflow
+/// check (proto.zig, `ml = ... + length_of_len + 2`), so a 2^64-1 length panics the process
+/// (AUDIT2 L4). The package lives in the zig package cache, so the guard lives here.
+/// `Reader.read` may consume several buffered frames in one call (fragments), so all complete
+/// headers in the buffer are checked, not just the first.
+fn guardFrameLengths(reader: *const websocket.proto.Reader, max_payload: usize) !void {
+    const data = reader.buf.data[reader.start..reader.pos];
+    var offset: usize = 0;
+    if (reader.message_len != 0) {
+        // The current frame's header was already validated; skip to whatever follows it.
+        offset = reader.message_len;
+    }
+    while (offset < data.len) {
+        const rest = data[offset..];
+        if (rest.len < 2) return;
+        const length_of_len: usize = switch (rest[1] & 127) {
+            126 => 2,
+            127 => 8,
+            else => 0,
+        };
+        if (rest.len < 2 + length_of_len) return;
+        const payload_len: u64 = switch (length_of_len) {
+            2 => std.mem.readInt(u16, rest[2..4], .big),
+            8 => std.mem.readInt(u64, rest[2..10], .big),
+            else => rest[1] & 127,
+        };
+        if (payload_len > max_payload) return error.MessageTooLarge;
+        const masked = rest[1] & 128 == 128;
+        const total: usize = 2 + length_of_len + @as(usize, if (masked) 4 else 0) + @as(usize, @intCast(payload_len));
+        if (rest.len < total) return;
+        offset += total;
+    }
 }
 
 fn writeSocketAll(socket: posix.socket_t, data: []const u8) !void {
@@ -2775,6 +2950,18 @@ fn freeOptionalOwned(allocator: Allocator, slot: *?[]u8) void {
         allocator.free(value);
         slot.* = null;
     }
+}
+
+/// JS truthiness of an encoded JSON body: TS `publish` drops `null`, `false`, `0` and `""`.
+fn isFalsyJson(body_json: ?[]const u8) bool {
+    const raw = std.mem.trim(u8, body_json orelse return true, &std.ascii.whitespace);
+    if (raw.len == 0) return true;
+    if (std.mem.eql(u8, raw, "null") or std.mem.eql(u8, raw, "false") or std.mem.eql(u8, raw, "\"\"")) return true;
+    if (raw[0] == '-' or std.ascii.isDigit(raw[0])) {
+        const number = std.fmt.parseFloat(f64, raw) catch return false;
+        return number == 0;
+    }
+    return false;
 }
 
 fn joinTopicAlloc(allocator: Allocator, prefix: []const u8, suffix: []const u8) ![]u8 {

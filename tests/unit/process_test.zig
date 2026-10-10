@@ -416,3 +416,287 @@ test "websocket client handles serial sends without writer thread" {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for AUDIT2 (hostile server) and AUDIT (hostile client) findings.
+// ---------------------------------------------------------------------------
+
+/// A one-shot raw WebSocket server: completes the handshake, waits for the client's first frame,
+/// writes `reply` verbatim (any bytes, including malformed frames), then idles until the client
+/// disconnects.
+const HostileServer = struct {
+    server: std.net.Server,
+    reply: []const u8,
+    thread: ?std.Thread = null,
+
+    fn start(self: *HostileServer, reply: []const u8) !u16 {
+        const address = try std.net.Address.parseIp("127.0.0.1", 0);
+        self.server = try address.listen(.{ .reuse_address = true });
+        self.reply = reply;
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        return self.server.listen_address.getPort();
+    }
+
+    fn join(self: *HostileServer) void {
+        if (self.thread) |thread| thread.join();
+        self.server.deinit();
+    }
+
+    fn run(self: *HostileServer) void {
+        var conn = self.server.accept() catch return;
+        defer conn.stream.close();
+        var buf: [8192]u8 = undefined;
+        var len: usize = 0;
+        while (std.mem.indexOf(u8, buf[0..len], "\r\n\r\n") == null) {
+            const n = conn.stream.read(buf[len..]) catch return;
+            if (n == 0) return;
+            len += n;
+        }
+        const marker = "sec-websocket-key:";
+        const key_start = (std.ascii.indexOfIgnoreCase(buf[0..len], marker) orelse return) + marker.len;
+        const key_end = std.mem.indexOfPos(u8, buf[0..len], key_start, "\r\n") orelse return;
+        const key = std.mem.trim(u8, buf[key_start..key_end], " ");
+        var hash: [20]u8 = undefined;
+        var hasher = std.crypto.hash.Sha1.init(.{});
+        hasher.update(key);
+        hasher.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        hasher.final(&hash);
+        var accept_buf: [28]u8 = undefined;
+        const accept = std.base64.standard.Encoder.encode(&accept_buf, &hash);
+        var response_buf: [256]u8 = undefined;
+        const response = std.fmt.bufPrint(&response_buf, "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: upgrade\r\nsec-websocket-accept: {s}\r\n\r\n", .{accept}) catch return;
+        conn.stream.writeAll(response) catch return;
+        _ = conn.stream.read(&buf) catch return; // the client's request frame
+        conn.stream.writeAll(self.reply) catch return;
+        while (true) {
+            const n = conn.stream.read(&buf) catch return;
+            if (n == 0) return;
+        }
+    }
+};
+
+fn textFrameAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, 0x81);
+    if (payload.len < 126) {
+        try out.append(allocator, @intCast(payload.len));
+    } else if (payload.len <= 0xffff) {
+        try out.append(allocator, 126);
+        try out.appendSlice(allocator, &std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(payload.len))));
+    } else {
+        try out.append(allocator, 127);
+        try out.appendSlice(allocator, &std.mem.toBytes(std.mem.nativeToBig(u64, payload.len)));
+    }
+    try out.appendSlice(allocator, payload);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Sends one call to a hostile server answering with `reply` and returns the error text the call
+/// settled with (caller frees). Before the AUDIT2 §1.1 fix every one of these double-freed.
+fn callHostile(reply: []const u8) ![]u8 {
+    var hostile: HostileServer = undefined;
+    const port = try hostile.start(reply);
+    defer hostile.join();
+
+    var ch = channel.Channel(TestState).init(testing.allocator);
+    defer ch.deinit();
+    var client = try ch.connect(testing.allocator, port, .{});
+    defer client.deinit();
+
+    var result = try client.send(testing.allocator, i64, "echo", @as(i64, 5));
+    defer result.deinit(testing.allocator);
+    return switch (result) {
+        .ok => error.TestUnexpectedResult,
+        .remote_err => |value| try testing.allocator.dupe(u8, value),
+    };
+}
+
+test "hostile server: bad json reply settles the call with an error" {
+    const frame = try textFrameAlloc(testing.allocator, "{not json");
+    defer testing.allocator.free(frame);
+    const text = try callHostile(frame);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("invalid message", text);
+}
+
+test "hostile server: error-object reply surfaces as an error" {
+    const frame = try textFrameAlloc(testing.allocator, "{\"id\":1,\"error\":{\"code\":500,\"message\":\"nope\"}}");
+    defer testing.allocator.free(frame);
+    const text = try callHostile(frame);
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "500") != null);
+}
+
+test "hostile server: 2^64-1 and 2^63-1 frame lengths don't overflow" {
+    for ([_]u64{ std.math.maxInt(u64), std.math.maxInt(i64), max_plus_one }) |length| {
+        var frame: [10]u8 = .{ 0x81, 127, 0, 0, 0, 0, 0, 0, 0, 0 };
+        std.mem.writeInt(u64, frame[2..10], length, .big);
+        const text = try callHostile(&frame);
+        defer testing.allocator.free(text);
+        try testing.expectEqualStrings("message too large", text);
+    }
+}
+const max_plus_one: u64 = channel.max_message_size + 1;
+
+test "hostile server: deeply nested json doesn't crash" {
+    const depth = 100_000;
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(testing.allocator);
+    try payload.appendSlice(testing.allocator, "{\"id\":1,\"body\":");
+    try payload.appendNTimes(testing.allocator, '[', depth);
+    try payload.appendNTimes(testing.allocator, ']', depth);
+    try payload.append(testing.allocator, '}');
+    const frame = try textFrameAlloc(testing.allocator, payload.items);
+    defer testing.allocator.free(frame);
+    const text = try callHostile(frame);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("invalid message", text);
+}
+
+test "hostile server: invalid utf-8 doesn't crash" {
+    const frame = try textFrameAlloc(testing.allocator, "{\"id\":1,\"body\":\"\xff\xfe\"}");
+    defer testing.allocator.free(frame);
+    const text = try callHostile(frame);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("invalid message", text);
+}
+
+test "large (8 MiB) reply is accepted" {
+    const size = 8 * 1024 * 1024;
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(testing.allocator);
+    try payload.appendSlice(testing.allocator, "{\"id\":1,\"body\":\"");
+    try payload.appendNTimes(testing.allocator, 'a', size);
+    try payload.appendSlice(testing.allocator, "\"}");
+    const frame = try textFrameAlloc(testing.allocator, payload.items);
+    defer testing.allocator.free(frame);
+
+    var hostile: HostileServer = undefined;
+    const port = try hostile.start(frame);
+    defer hostile.join();
+    var ch = channel.Channel(TestState).init(testing.allocator);
+    defer ch.deinit();
+    var client = try ch.connect(testing.allocator, port, .{});
+    defer client.deinit();
+    var result = try client.send(testing.allocator, []const u8, "echo", @as(i64, 5));
+    defer result.deinit(testing.allocator);
+    switch (result) {
+        .ok => |value| try testing.expectEqual(@as(usize, size), value.?.len),
+        .remote_err => return error.TestUnexpectedResult,
+    }
+}
+
+fn pollServerFor(server: anytype, iterations: usize) void {
+    var index: usize = 0;
+    while (index < iterations) : (index += 1) {
+        _ = server.poll() catch {};
+        std.Thread.sleep(1_000_000);
+    }
+}
+
+test "server survives a 2^64-1 frame length and keeps serving" {
+    var server_ch = channel.Channel(ServerState).init(testing.allocator);
+    defer server_ch.deinit();
+    _ = try server_ch.post("echo", websocketEcho);
+    var server = try server_ch.listen(testing.allocator, 0, .{});
+    defer server.deinit();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", server.port());
+    const raw = try std.net.tcpConnectToAddress(address);
+    defer raw.close();
+    try raw.writeAll("GET / HTTP/1.1\r\nhost: 127.0.0.1\r\nupgrade: websocket\r\nconnection: upgrade\r\nsec-websocket-version: 13\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+    pollServerFor(&server, 20);
+    var buf: [1024]u8 = undefined;
+    const n = try raw.read(&buf);
+    try testing.expect(std.mem.startsWith(u8, buf[0..n], "HTTP/1.1 101"));
+
+    // masked text frame announcing 2^64-1 bytes
+    try raw.writeAll(&[_]u8{ 0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 2, 3, 4 });
+    pollServerFor(&server, 20);
+    try testing.expectEqual(@as(usize, 0), try raw.read(&buf)); // the server closed it
+
+    var client_ch = channel.Channel(TestState).init(testing.allocator);
+    defer client_ch.deinit();
+    var client = try client_ch.connect(testing.allocator, server.port(), .{});
+    defer client.deinit();
+    var result = try client.send(testing.allocator, i64, "echo", @as(i64, 9));
+    defer result.deinit(testing.allocator);
+    switch (result) {
+        .ok => |value| try testing.expectEqual(@as(?i64, 9), value),
+        .remote_err => return error.TestUnexpectedResult,
+    }
+}
+
+test "server answers an undecodable request body with an error" {
+    var server_ch = channel.Channel(ServerState).init(testing.allocator);
+    defer server_ch.deinit();
+    _ = try server_ch.post("echo", websocketEcho);
+    var server = try server_ch.listen(testing.allocator, 0, .{});
+    defer server.deinit();
+
+    var client_ch = channel.Channel(TestState).init(testing.allocator);
+    defer client_ch.deinit();
+    var client = try client_ch.connect(testing.allocator, server.port(), .{});
+    defer client.deinit();
+
+    var bad = try client.send(testing.allocator, i64, "echo", "not a number");
+    defer bad.deinit(testing.allocator);
+    switch (bad) {
+        .ok => return error.TestUnexpectedResult,
+        .remote_err => {},
+    }
+    // the connection is still usable
+    var good = try client.send(testing.allocator, i64, "echo", @as(i64, 3));
+    defer good.deinit(testing.allocator);
+    switch (good) {
+        .ok => |value| try testing.expectEqual(@as(?i64, 3), value),
+        .remote_err => return error.TestUnexpectedResult,
+    }
+}
+
+fn roomTopic(allocator: std.mem.Allocator, request: []const u8) anyerror![]const u8 {
+    return std.fmt.allocPrint(allocator, "room-{s}", .{request});
+}
+
+fn roomBody(_: std.mem.Allocator, _: []const u8) anyerror!?i64 {
+    return 7;
+}
+
+fn countEvent(user_data: ?*anyopaque, event: i64) void {
+    const sum: *i64 = @ptrCast(@alignCast(user_data orelse return));
+    sum.* += event;
+}
+
+test "subscription topic/body formatters and falsy bodies" {
+    var events = .{
+        .rooms = channel.Subscription([]const u8, i64).init(),
+    };
+    _ = events.rooms.topic(roomTopic).body(roomBody);
+
+    var ch = channel.Channel(TestState).init(testing.allocator);
+    defer ch.deinit();
+    _ = try ch.events(&events, "");
+    defer events.rooms.deinit();
+
+    var process = try ch.process(testing.allocator, .{});
+    defer process.deinit();
+
+    var sum: i64 = 0;
+    var subscribe_result = try process.subscribe(testing.allocator, []const u8, i64, void, "rooms", "a", {}, &sum, countEvent);
+    defer subscribe_result.deinit(testing.allocator);
+    switch (subscribe_result) {
+        .ok => {},
+        .remote_err => return error.TestUnexpectedResult,
+    }
+    try testing.expect(process.isRemoteSubscribed("rooms/room-a"));
+
+    try events.rooms.send(testing.allocator, "a", 0); // falsy: dropped, like TS
+    try testing.expectEqual(@as(i64, 0), sum);
+    try events.rooms.send(testing.allocator, "a", 5);
+    try testing.expectEqual(@as(i64, 5), sum);
+    try events.rooms.sendDefault(testing.allocator, "a"); // body formatter
+    try testing.expectEqual(@as(i64, 12), sum);
+    try events.rooms.send(testing.allocator, "b", 100); // other topic
+    try testing.expectEqual(@as(i64, 12), sum);
+}
