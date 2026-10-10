@@ -30,7 +30,7 @@ wait_for_port() {
 }
 
 start_fixture_if_needed() {
-  if pgrep -f "$FIXTURE_DIR/tests/server.ts" >/dev/null 2>&1; then
+  if pgrep -f "$FIXTURE_DIR/tests/server.ts" >/dev/null 2>&1 || nc -z 127.0.0.1 2049 >/dev/null 2>&1; then
     echo "Using existing fixture server on 127.0.0.1:2049"
     return 0
   fi
@@ -48,10 +48,24 @@ start_fixture_if_needed() {
   fi
 }
 
+# channel-zig and its websocket dependency need Zig 0.15 (0.17 changed the build API). Prefer the
+# Homebrew zig@0.15 keg over whatever `zig` is on PATH; ZIG=... overrides.
+if [[ -z "${ZIG:-}" ]]; then
+  if [[ -x /opt/homebrew/opt/zig@0.15/bin/zig ]]; then
+    ZIG=/opt/homebrew/opt/zig@0.15/bin/zig
+  else
+    ZIG=zig
+  fi
+fi
+case "$("$ZIG" version)" in
+  0.15.*) ;;
+  *) echo "channel-zig needs Zig 0.15.x, got $("$ZIG" version) ($ZIG). Set ZIG=/path/to/zig-0.15." >&2; exit 1 ;;
+esac
+
 cd "$ROOT"
 start_fixture_if_needed
 
-zig build test-unit
-zig build test-integration
+"$ZIG" build test-unit
+"$ZIG" build test-integration
 
 echo "All channel-zig tests passed."
