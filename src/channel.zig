@@ -800,11 +800,25 @@ pub fn Channel(comptime State: type) type {
         const OtherPostHandler = struct {
             matcher: *const fn ([]const u8) bool,
             handler: ErasedPostHandler,
+            /// Set by merge(): the matcher only sees paths under this scope ("m/"), with it stripped.
+            scope: []const u8 = "",
+
+            pub fn matches(self: OtherPostHandler, path: []const u8) bool {
+                if (!std.mem.startsWith(u8, path, self.scope)) return false;
+                return self.matcher(path[self.scope.len..]);
+            }
         };
 
         const OtherStreamHandler = struct {
             matcher: *const fn ([]const u8) bool,
             handler: ErasedStreamHandler,
+            /// Set by merge(): the matcher only sees paths under this scope ("m/"), with it stripped.
+            scope: []const u8 = "",
+
+            pub fn matches(self: OtherStreamHandler, path: []const u8) bool {
+                if (!std.mem.startsWith(u8, path, self.scope)) return false;
+                return self.matcher(path[self.scope.len..]);
+            }
         };
 
         pub fn init(allocator: Allocator) Self {
@@ -937,7 +951,32 @@ pub fn Channel(comptime State: type) type {
                 try self.subscriptions.put(self.allocator, merged, entry.value_ptr.*);
             }
 
+            for (other.other_posts.items) |entry| {
+                var scoped = entry;
+                scoped.scope = try self.mergedScope(prefix, entry.scope);
+                try self.other_posts.append(self.allocator, scoped);
+            }
+
+            for (other.other_streams.items) |entry| {
+                var scoped = entry;
+                scoped.scope = try self.mergedScope(prefix, entry.scope);
+                try self.other_streams.append(self.allocator, scoped);
+            }
+
             return self;
+        }
+
+        /// Scope for a catch-all merged under `prefix`: "prefix/" + its existing scope.
+        fn mergedScope(self: *Self, prefix: []const u8, scope: []const u8) ![]const u8 {
+            if (prefix.len == 0 and scope.len == 0) return "";
+            // Owned copy, so `other` may be deinitialized after the merge.
+            const merged = if (prefix.len == 0)
+                try self.allocator.dupe(u8, scope)
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ prefix, scope });
+            errdefer self.allocator.free(merged);
+            try self.owned_strings.append(self.allocator, merged);
+            return merged;
         }
 
         pub fn onDisconnect(self: *Self, callback: *const fn (*State, Sender(State)) void) *Self {
@@ -1002,7 +1041,7 @@ pub fn Channel(comptime State: type) type {
                     return handler.invoke(self, peer, path, message.body_json, message.context_json, message.id);
                 }
                 for (self.other_posts.items) |other| {
-                    if (other.matcher(path)) {
+                    if (other.matches(path)) {
                         return other.handler.invoke(self, peer, path, message.body_json, message.context_json, message.id);
                     }
                 }
@@ -1023,7 +1062,7 @@ pub fn Channel(comptime State: type) type {
                     return handler.invoke(self, peer, path, message.body_json, message.context_json, message.id);
                 }
                 for (self.other_streams.items) |other| {
-                    if (other.matcher(path)) {
+                    if (other.matches(path)) {
                         return other.handler.invoke(self, peer, path, message.body_json, message.context_json, message.id);
                     }
                 }

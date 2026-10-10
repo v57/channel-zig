@@ -156,6 +156,62 @@ test "process send success and error" {
     try testing.expectEqual(@as(i64, 3), index);
 }
 
+fn mergeMatchDyn(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "dyn/");
+}
+
+fn mergeMatchFeed(path: []const u8) bool {
+    return std.mem.eql(u8, path, "feed");
+}
+
+fn mergeOtherPost(request: channel.PostRequest(TestState, void, void)) !?[]const u8 {
+    return request.path;
+}
+
+fn mergeOtherStream(request: channel.StreamRequest(TestState, void, void, i64)) !void {
+    try request.emitter.emit(testing.allocator, 1);
+}
+
+test "merge keeps postOther/streamOther routes under the prefix" {
+    var inner = channel.Channel(TestState).init(testing.allocator);
+    defer inner.deinit();
+    _ = try inner.postOther(void, []const u8, void, mergeMatchDyn, mergeOtherPost);
+    _ = try inner.streamOther(void, i64, void, mergeMatchFeed, mergeOtherStream);
+
+    var outer = channel.Channel(TestState).init(testing.allocator);
+    defer outer.deinit();
+    _ = try outer.merge(&inner, "m");
+
+    try testing.expectEqual(@as(usize, 1), outer.other_posts.items.len);
+    try testing.expect(outer.other_posts.items[0].matches("m/dyn/x"));
+    try testing.expect(!outer.other_posts.items[0].matches("dyn/x"));
+    try testing.expect(outer.other_streams.items[0].matches("m/feed"));
+
+    var process = try outer.process(testing.allocator, .{});
+    defer process.deinit();
+
+    var hit = try process.send(testing.allocator, []const u8, "m/dyn/x", {});
+    defer hit.deinit(testing.allocator);
+    switch (hit) {
+        .ok => |value| try testing.expectEqualStrings("m/dyn/x", value.?),
+        .remote_err => return error.TestUnexpectedResult,
+    }
+
+    var miss = try process.send(testing.allocator, []const u8, "dyn/x", {});
+    defer miss.deinit(testing.allocator);
+    switch (miss) {
+        .ok => return error.TestUnexpectedResult,
+        .remote_err => |value| try testing.expectEqualStrings("api not found", value),
+    }
+
+    // Without a prefix the matchers are reused as-is
+    var flat = channel.Channel(TestState).init(testing.allocator);
+    defer flat.deinit();
+    _ = try flat.merge(&inner, "");
+    try testing.expect(flat.other_posts.items[0].matches("dyn/x"));
+    try testing.expect(flat.other_posts.items[0].matcher == mergeMatchDyn);
+}
+
 test "process subscription cancel and stream cancel" {
     var events = .{
         .hello = channel.Subscription([]const u8, []const u8).init(),
