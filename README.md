@@ -36,16 +36,17 @@ fn hello(_: channel.PostRequest(AppState, void, void)) !?[]const u8 {
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
-    var ch = try channel.Channel(AppState).init(allocator);
-    defer ch.deinit(allocator);
+    var ch = channel.Channel(AppState).init(allocator);
+    defer ch.deinit();
 
     _ = try ch.post("hello", hello);
 
     var process = try ch.process(allocator, .{});
-    defer process.deinit(allocator);
+    defer process.deinit();
 
     var result = try process.send(allocator, []const u8, "hello", {});
     defer result.deinit(allocator);
+    std.debug.print("{s}\n", .{result.ok.?});
 }
 ```
 
