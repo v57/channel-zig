@@ -16,6 +16,11 @@ Dependency in `build.zig.zon`:
 }
 ```
 
+# Dependencies
+
+[websocket.zig](https://github.com/karlseguin/websocket.zig) for the WebSocket client and server (pinned in
+`build.zig.zon`). JSON is `std.json`.
+
 # Usage
 
 ```zig
