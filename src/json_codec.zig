@@ -21,9 +21,49 @@ pub fn decodeRequired(allocator: Allocator, comptime T: type, json: ?[]const u8)
         }
     }
 
+    if (T == std.json.Value) {
+        // The leaky parser also allocates number buffers that can't be freed
+        // one by one, so parse into an arena and copy out an owned tree that
+        // freeOwnedValue releases completely.
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        return try cloneJsonValue(allocator, parsed.value);
+    }
+
     return try std.json.parseFromSliceLeaky(T, allocator, raw, .{
         .allocate = .alloc_always,
     });
+}
+
+/// A deep copy of `value` whose strings, object keys and containers are all
+/// owned by `allocator` (free it with freeOwnedValue).
+fn cloneJsonValue(allocator: Allocator, value: std.json.Value) Allocator.Error!std.json.Value {
+    return switch (value) {
+        .string => |text| .{ .string = try allocator.dupe(u8, text) },
+        .number_string => |text| .{ .number_string = try allocator.dupe(u8, text) },
+        .array => |array| blk: {
+            var out = std.json.Array.init(allocator);
+            errdefer freeJsonValue(allocator, .{ .array = out });
+            try out.ensureTotalCapacity(array.items.len);
+            for (array.items) |item| out.appendAssumeCapacity(try cloneJsonValue(allocator, item));
+            break :blk .{ .array = out };
+        },
+        .object => |object| blk: {
+            var out = std.json.ObjectMap.init(allocator);
+            errdefer freeJsonValue(allocator, .{ .object = out });
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                const key = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer allocator.free(key);
+                var item = try cloneJsonValue(allocator, entry.value_ptr.*);
+                errdefer freeJsonValue(allocator, item);
+                try out.put(key, item);
+                item = .null;
+            }
+            break :blk .{ .object = out };
+        },
+        else => value,
+    };
 }
 
 /// Decodes a request context. TS hands handlers `context ?? {}`, so a missing
@@ -106,8 +146,8 @@ pub fn freeOwnedValue(allocator: Allocator, comptime T: type, value: *T) void {
     }
 }
 
-/// Frees a std.json.Value decoded with `.allocate = .alloc_always`: strings,
-/// object keys and containers are all owned.
+/// Frees a std.json.Value from decodeRequired: strings, object keys and
+/// containers are all owned.
 fn freeJsonValue(allocator: Allocator, value: std.json.Value) void {
     switch (value) {
         .string => |text| allocator.free(text),
