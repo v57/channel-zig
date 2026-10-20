@@ -156,6 +156,54 @@ test "process send success and error" {
     try testing.expectEqual(@as(i64, 3), index);
 }
 
+fn postContextKind(request: channel.PostRequest(TestState, void, std.json.Value)) !?[]const u8 {
+    return switch (request.context) {
+        .object => |map| if (map.get("service")) |service| service.string else "object",
+        else => "other",
+    };
+}
+
+fn streamContextKind(request: channel.StreamRequest(TestState, void, std.json.Value, []const u8)) !void {
+    try request.emitter.emit(testing.allocator, switch (request.context) {
+        .object => "object",
+        else => "other",
+    });
+}
+
+test "a handler that reads the context gets {} when the caller sends none" {
+    var ch = channel.Channel(TestState).init(testing.allocator);
+    defer ch.deinit();
+    _ = try ch.post("context", postContextKind);
+    _ = try ch.stream(void, []const u8, std.json.Value, "context/stream", streamContextKind);
+
+    var process = try ch.process(testing.allocator, .{});
+    defer process.deinit();
+
+    var missing = try process.send(testing.allocator, []const u8, "context", {});
+    defer missing.deinit(testing.allocator);
+    switch (missing) {
+        .ok => |value| try testing.expectEqualStrings("object", value.?),
+        .remote_err => return error.TestUnexpectedResult,
+    }
+
+    const Context = struct { service: []const u8 };
+    var sent = try process.sendWithContext(testing.allocator, []const u8, "context", {}, Context{ .service = "abc" });
+    defer sent.deinit(testing.allocator);
+    switch (sent) {
+        .ok => |value| try testing.expectEqualStrings("abc", value.?),
+        .remote_err => return error.TestUnexpectedResult,
+    }
+
+    var values = try process.values(testing.allocator, void, []const u8, void, "context/stream", {}, {});
+    defer values.close();
+    var next = try values.next(testing.allocator);
+    defer next.deinit(testing.allocator);
+    switch (next) {
+        .item => |value| try testing.expectEqualStrings("object", value),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 fn mergeMatchDyn(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "dyn/");
 }

@@ -26,6 +26,14 @@ pub fn decodeRequired(allocator: Allocator, comptime T: type, json: ?[]const u8)
     });
 }
 
+/// Decodes a request context. TS hands handlers `context ?? {}`, so a missing
+/// context is tried as `{}` first and then as `null` (channel-rs parity);
+/// handlers that read the context keep working for callers that send none.
+pub fn decodeContext(allocator: Allocator, comptime T: type, json: ?[]const u8) !T {
+    if (json) |raw| return decodeRequired(allocator, T, raw);
+    return decodeRequired(allocator, T, "{}") catch decodeRequired(allocator, T, "null");
+}
+
 pub fn decodeOptional(allocator: Allocator, comptime T: type, json: ?[]const u8) !?T {
     if (json == null) {
         return null;
@@ -41,6 +49,7 @@ pub fn isOptionalType(comptime T: type) bool {
 }
 
 pub fn freeOwnedValue(allocator: Allocator, comptime T: type, value: *T) void {
+    if (T == std.json.Value) return freeJsonValue(allocator, value.*);
     switch (@typeInfo(T)) {
         .void,
         .bool,
@@ -93,6 +102,29 @@ pub fn freeOwnedValue(allocator: Allocator, comptime T: type, value: *T) void {
             }
         },
         .@"union" => {},
+        else => {},
+    }
+}
+
+/// Frees a std.json.Value decoded with `.allocate = .alloc_always`: strings,
+/// object keys and containers are all owned.
+fn freeJsonValue(allocator: Allocator, value: std.json.Value) void {
+    switch (value) {
+        .string => |text| allocator.free(text),
+        .number_string => |text| allocator.free(text),
+        .array => |array| {
+            for (array.items) |item| freeJsonValue(allocator, item);
+            array.deinit();
+        },
+        .object => |object| {
+            var map = object;
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                freeJsonValue(allocator, entry.value_ptr.*);
+            }
+            map.deinit();
+        },
         else => {},
     }
 }

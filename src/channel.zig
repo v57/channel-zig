@@ -1282,7 +1282,7 @@ pub fn Channel(comptime State: type) type {
                         return;
                     };
                     defer json_codec.freeOwnedValue(channel.allocator, Req, &body);
-                    var context = json_codec.decodeRequired(channel.allocator, Ctx, context_json) catch |err| {
+                    var context = json_codec.decodeContext(channel.allocator, Ctx, context_json) catch |err| {
                         if (id) |request_id| return peer.replyError(request_id, err);
                         return;
                     };
@@ -1343,7 +1343,7 @@ pub fn Channel(comptime State: type) type {
                         return peer.replyError(request_id, err);
                     };
                     defer json_codec.freeOwnedValue(channel.allocator, Req, &body);
-                    var context = json_codec.decodeRequired(channel.allocator, Ctx, context_json) catch |err| {
+                    var context = json_codec.decodeContext(channel.allocator, Ctx, context_json) catch |err| {
                         return peer.replyError(request_id, err);
                     };
                     defer json_codec.freeOwnedValue(channel.allocator, Ctx, &context);
