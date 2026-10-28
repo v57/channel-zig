@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# In the Hub checkout this runs in its toolchain container (HubTools/hub-run); elsewhere it runs here.
+hub_run="$(dirname "$0")/../../../HubTools/hub-run"
+[[ -n "${HUB_TOOLCHAIN:-}" || ! -x "$hub_run" ]] || exec "$hub_run" bash "$0" "$@"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FIXTURE_DIR="$ROOT/../channel"
@@ -48,15 +51,9 @@ start_fixture_if_needed() {
   fi
 }
 
-# channel-zig and its websocket dependency need Zig 0.15 (0.17 changed the build API). Prefer the
-# Homebrew zig@0.15 keg over whatever `zig` is on PATH; ZIG=... overrides.
-if [[ -z "${ZIG:-}" ]]; then
-  if [[ -x /opt/homebrew/opt/zig@0.15/bin/zig ]]; then
-    ZIG=/opt/homebrew/opt/zig@0.15/bin/zig
-  else
-    ZIG=zig
-  fi
-fi
+# channel-zig and its websocket dependency need Zig 0.15 (0.17 changed the build API); the Hub
+# toolchain image has it. ZIG=... overrides.
+ZIG="${ZIG:-zig}"
 case "$("$ZIG" version)" in
   0.15.*) ;;
   *) echo "channel-zig needs Zig 0.15.x, got $("$ZIG" version) ($ZIG). Set ZIG=/path/to/zig-0.15." >&2; exit 1 ;;
