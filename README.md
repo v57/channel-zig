@@ -130,7 +130,8 @@ Every client connection dials from its own UDP socket, never a shared one: Netwo
 (the idle timeout is 30 s) while it's polled. Like this port's WebSocket client, it doesn't reconnect: a lost
 connection fails the pending calls and stops the client.
 
-Which languages support QUIC: see `channel/docs/quic.md`.
+Languages with QUIC: TypeScript, Go, Swift, C#, Rust, Python, Elixir, Java, Kotlin, C and Zig; Dart, Ruby and PHP stay
+on WebSocket (libraries and status in `channel/docs/quic.md`).
 
 # Requirements
 
