@@ -2,6 +2,14 @@ const std = @import("std");
 const websocket = @import("websocket");
 const wire = @import("wire.zig");
 const json_codec = @import("json_codec.zig");
+const quic_frame = @import("quic_frame.zig");
+/// OpenSSL's QUIC with `-Dquic=true`, a stub otherwise (quic_disabled.zig)
+const quic_engine = @import("quic_engine");
+
+/// QUIC framing helpers (frames, hello, fingerprints); usable without `-Dquic`.
+pub const quic = quic_frame;
+/// Whether this build has the QUIC transport (`zig build -Dquic=true`, links the system OpenSSL 3.5+).
+pub const quic_enabled = quic_engine.enabled;
 
 pub const Allocator = std.mem.Allocator;
 const net = std.net;
@@ -16,6 +24,8 @@ const TransportMode = enum {
     process,
     websocket_client,
     websocket_server,
+    quic_client,
+    quic_server,
 };
 
 const TransportVTable = struct {
@@ -230,7 +240,32 @@ pub const SubscriptionHandle = struct {
 pub fn ConnectOptions(comptime State: type) type {
     return struct {
         state: ?State = null,
+        /// Extra headers, "Name: value\r\n" lines. Over QUIC they go in the hello frame.
         headers: ?[]const u8 = null,
+        /// TLS settings for `quic://` addresses.
+        quic: QuicOptions = .{},
+    };
+}
+
+/// TLS settings for `quic://` addresses. Without any, the server certificate must be trusted by the system.
+pub const QuicOptions = struct {
+    /// PEM certificate (or CA) to trust, for self-signed servers.
+    ca: ?[]const u8 = null,
+    /// SHA-256 fingerprint of the server certificate (hex, colons optional), pinned instead of verifying it.
+    fingerprint: ?[]const u8 = null,
+    /// Overrides the name sent (SNI) and checked; defaults to the address host.
+    server_name: ?[]const u8 = null,
+};
+
+pub fn QuicListenOptions(comptime State: type) type {
+    return struct {
+        state: ?*const fn (headers: *const std.StringHashMapUnmanaged([]const u8)) anyerror!State = null,
+        on_connect: ?*const fn (state: *State, sender: Sender(State)) void = null,
+        on_disconnect: ?*const fn (state: *State, sender: Sender(State)) void = null,
+        /// PEM certificate chain, leaf first.
+        cert: []const u8,
+        /// PEM private key.
+        key: []const u8,
     };
 }
 
@@ -992,7 +1027,15 @@ pub fn Channel(comptime State: type) type {
             };
         }
 
+        /// `ws://host:port/path`, `host:port`, a port, or `quic://host:port` (needs `-Dquic=true`).
         pub fn connect(self: *Self, allocator: Allocator, address: anytype, options: ConnectOptions(State)) !Client(State) {
+            switch (@typeInfo(@TypeOf(address))) {
+                .int, .comptime_int => {},
+                else => {
+                    const text: []const u8 = address;
+                    if (std.mem.startsWith(u8, text, "quic://")) return self.connectQuic(allocator, text, options);
+                },
+            }
             const target = try parseConnectTarget(allocator, address);
 
             const Transport = ClientTransport(State);
@@ -1012,6 +1055,50 @@ pub fn Channel(comptime State: type) type {
                 .destroy_ptr = transport,
                 .destroy_fn = Transport.destroyErased,
             };
+        }
+
+        fn connectQuic(self: *Self, allocator: Allocator, address: []const u8, options: ConnectOptions(State)) !Client(State) {
+            if (comptime !quic_engine.enabled) {
+                return error.QuicNotEnabled;
+            } else {
+                const Transport = QuicClientTransport(State);
+                const transport = try allocator.create(Transport);
+                errdefer allocator.destroy(transport);
+                transport.* = undefined;
+                try transport.init(allocator, self, options.state orelse std.mem.zeroes(State), address, options);
+                return .{
+                    .allocator = allocator,
+                    .peer = transport.peer,
+                    .poll_ptr = transport,
+                    .poll_fn = Transport.pollErased,
+                    .destroy_ptr = transport,
+                    .destroy_fn = Transport.destroyErased,
+                };
+            }
+        }
+
+        /// Serves this channel over QUIC on UDP (`port` or "host:port"). Needs `zig build -Dquic=true`.
+        pub fn listenQuic(self: *Self, allocator: Allocator, address: anytype, options: QuicListenOptions(State)) !Server(State) {
+            if (comptime !quic_engine.enabled) {
+                @compileError("listenQuic needs channel built with -Dquic=true (links the system OpenSSL 3.5+)");
+            } else {
+                const target = try parseListenTarget(address);
+                const Transport = QuicServerTransport(State);
+                const transport = try allocator.create(Transport);
+                errdefer allocator.destroy(transport);
+                transport.* = undefined;
+                try transport.init(allocator, self, target, options);
+                return .{
+                    .allocator = allocator,
+                    .port_value = transport.port_value,
+                    .poll_fn = Transport.pollErased,
+                    .poll_ptr = transport,
+                    .stop_fn = Transport.stopErased,
+                    .stop_ptr = transport,
+                    .destroy_fn = Transport.destroyErased,
+                    .destroy_ptr = transport,
+                };
+            }
         }
 
         pub fn listen(self: *Self, allocator: Allocator, address: anytype, options: ListenOptions(State)) !Server(State) {
@@ -2739,6 +2826,513 @@ fn ServerTransport(comptime State: type) type {
             var index: usize = 0;
             while (index < self.connections.items.len) : (index += 1) {
                 if (self.connections.items[index] == target) {
+                    _ = self.connections.swapRemove(index);
+                    return;
+                }
+            }
+        }
+
+        fn stopErased(ptr: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.stop();
+        }
+
+        fn destroyErased(ptr: *anyopaque, allocator: Allocator) void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.deinit(allocator);
+            allocator.destroy(self);
+        }
+    };
+}
+
+/// Bytes queued for a QUIC stream: frames wait here while the stream applies flow control.
+const QuicOutbox = struct {
+    bytes: std.ArrayListUnmanaged(u8) = .{},
+    start: usize = 0,
+
+    fn deinit(self: *QuicOutbox, allocator: Allocator) void {
+        self.bytes.deinit(allocator);
+    }
+
+    fn push(self: *QuicOutbox, allocator: Allocator, payload: []const u8) !void {
+        try quic_frame.appendFrame(&self.bytes, allocator, payload);
+    }
+
+    fn flush(self: *QuicOutbox, allocator: Allocator, stream: *quic_engine.Ssl) !void {
+        while (self.start < self.bytes.items.len) {
+            const n = try quic_engine.write(stream, self.bytes.items[self.start..]);
+            if (n == 0) break;
+            self.start += n;
+        }
+        if (self.start == self.bytes.items.len) {
+            self.start = 0;
+            if (self.bytes.capacity > 4 * 1024 * 1024) self.bytes.clearAndFree(allocator) else self.bytes.clearRetainingCapacity();
+        } else if (self.start >= 1024 * 1024) {
+            const left = self.bytes.items.len - self.start;
+            std.mem.copyForwards(u8, self.bytes.items[0..left], self.bytes.items[self.start..]);
+            self.bytes.items.len = left;
+            self.start = 0;
+        }
+    }
+};
+
+const quic_read_chunk: usize = 64 * 1024;
+
+fn resolveAddress(allocator: Allocator, host: []const u8, port: u16) !net.Address {
+    if (net.Address.parseIp(host, port)) |address| return address else |_| {}
+    const list = try net.getAddressList(allocator, host, port);
+    defer list.deinit();
+    if (list.addrs.len == 0) return error.UnknownHostName;
+    return list.addrs[0];
+}
+
+/// Client side of `quic://host:port`: its own UDP socket, one bidirectional stream, hello first.
+/// Like the WebSocket client it doesn't reconnect: a lost connection stops the peer.
+fn QuicClientTransport(comptime State: type) type {
+    return struct {
+        allocator: Allocator,
+        peer: *Peer(State),
+        conn: quic_engine.ClientConn,
+        reader: quic_frame.FrameReader = .{},
+        outbox: QuicOutbox = .{},
+        connected: bool = true,
+        next_keepalive_ms: i64,
+
+        const Self = @This();
+
+        fn init(
+            self: *Self,
+            allocator: Allocator,
+            channel: *Channel(State),
+            state: State,
+            address: []const u8,
+            options: ConnectOptions(State),
+        ) !void {
+            const pin = if (options.quic.fingerprint) |text| try quic_frame.parseFingerprint(text) else null;
+            const target = try quic_frame.parseTarget(allocator, address);
+            defer target.deinit(allocator);
+            const remote = try resolveAddress(allocator, target.host, target.port);
+
+            var conn = try quic_engine.ClientConn.open(allocator, target.host, remote, .{
+                .ca = options.quic.ca,
+                .fingerprint = pin,
+                .server_name = options.quic.server_name,
+            });
+            errdefer conn.deinit();
+            const deadline = std.time.milliTimestamp() + 10_000;
+            while (!(try conn.handshake())) {
+                if (!(try pumpAll())) {
+                    if (std.time.milliTimestamp() > deadline) return error.Timeout;
+                    std.Thread.sleep(100_000);
+                }
+            }
+
+            self.* = .{
+                .allocator = allocator,
+                .peer = undefined,
+                .conn = conn,
+                .next_keepalive_ms = std.time.milliTimestamp() + quic_frame.keepalive_interval_ms,
+            };
+            errdefer self.reader.deinit(allocator);
+            errdefer self.outbox.deinit(allocator);
+
+            const hello = try quic_frame.helloAlloc(allocator, options.headers);
+            defer allocator.free(hello);
+            try self.outbox.push(allocator, hello);
+            try self.outbox.flush(allocator, self.conn.ssl);
+
+            const peer = try Peer(State).createTransported(allocator, channel, state, .quic_client, self, .{
+                .send_frame = sendFrameErased,
+                .close = closeErased,
+                .is_connected = isConnectedErased,
+            });
+            errdefer peer.destroy();
+            self.peer = peer;
+            try registerPumpEntry(self, pollErased);
+        }
+
+        fn deinit(self: *Self, allocator: Allocator) void {
+            unregisterPumpEntry(self);
+            self.conn.deinit();
+            self.reader.deinit(allocator);
+            self.outbox.deinit(allocator);
+        }
+
+        fn destroyErased(ptr: *anyopaque, allocator: Allocator) void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.deinit(allocator);
+            allocator.destroy(self);
+        }
+
+        fn sendFrameErased(ptr: *anyopaque, payload: []u8) !void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            if (!self.connected) return error.NotConnected;
+            try self.outbox.push(self.allocator, payload);
+            self.outbox.flush(self.allocator, self.conn.ssl) catch {
+                closeErased(self);
+                return error.NotConnected;
+            };
+        }
+
+        /// Sends CONNECTION_CLOSE; the SSL objects and the socket go in `deinit`.
+        fn closeErased(ptr: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            if (!self.connected) return;
+            self.connected = false;
+            self.conn.close();
+        }
+
+        fn isConnectedErased(ptr: *anyopaque) bool {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return self.connected;
+        }
+
+        fn pollErased(ptr: *anyopaque) !bool {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return self.poll();
+        }
+
+        /// Errors are contained, as in the WebSocket client: they stop this client's peer.
+        fn poll(self: *Self) !bool {
+            if (!self.connected) return false;
+            self.conn.tick();
+            const now = std.time.milliTimestamp();
+            if (now >= self.next_keepalive_ms) {
+                self.next_keepalive_ms = now + quic_frame.keepalive_interval_ms;
+                self.outbox.bytes.appendSlice(self.allocator, &quic_frame.keepalive) catch {};
+            }
+            self.outbox.flush(self.allocator, self.conn.ssl) catch {
+                self.fail("disconnected");
+                return true;
+            };
+
+            var progressed = false;
+            while (true) {
+                const space = self.reader.writable(self.allocator, quic_read_chunk) catch {
+                    self.fail("out of memory");
+                    return true;
+                };
+                const n = quic_engine.read(self.conn.ssl, space) catch |err| switch (err) {
+                    error.WouldBlock => break,
+                    else => {
+                        self.fail("disconnected");
+                        return true;
+                    },
+                };
+                self.reader.commit(n);
+                progressed = true;
+                while (true) {
+                    const payload = (self.reader.next() catch {
+                        self.fail("message too large");
+                        return true;
+                    }) orelse break;
+                    self.peer.handleIncomingFrame(payload, .text) catch {
+                        self.fail("invalid message");
+                        return true;
+                    };
+                    if (!self.connected) return true;
+                }
+            }
+            if (self.conn.isTerminated()) {
+                self.fail("disconnected");
+                return true;
+            }
+            return progressed;
+        }
+
+        fn fail(self: *Self, reason: []const u8) void {
+            closeErased(self);
+            self.peer.stopWithReason(reason);
+        }
+    };
+}
+
+/// `listenQuic`: one UDP socket, a connection per client, each with exactly one bidirectional stream
+/// whose first frame is the hello.
+fn QuicServerTransport(comptime State: type) type {
+    return struct {
+        allocator: Allocator,
+        channel: *Channel(State),
+        options: QuicListenOptions(State),
+        listener: quic_engine.Listener,
+        listener_open: bool = true,
+        port_value: u16,
+        stopped: bool = false,
+        connections: std.ArrayListUnmanaged(*Connection) = .{},
+        /// Connections sending their CONNECTION_CLOSE; freed once done.
+        closing: std.ArrayListUnmanaged(Closing) = .{},
+
+        const Self = @This();
+
+        const Closing = struct {
+            conn: quic_engine.ServerConn,
+            deadline_ms: i64,
+        };
+
+        const Connection = struct {
+            allocator: Allocator,
+            server: *Self,
+            conn: quic_engine.ServerConn,
+            reader: quic_frame.FrameReader = .{},
+            outbox: QuicOutbox = .{},
+            peer: ?*Peer(State) = null,
+            closed: bool = false,
+            removed: bool = false,
+            /// Polls of this connection on the stack (a handler waiting on the client re-enters it).
+            depth: u32 = 0,
+
+            fn sendFrameErased(ptr: *anyopaque, payload: []u8) !void {
+                const self: *Connection = @ptrCast(@alignCast(ptr));
+                if (self.closed) return error.NotConnected;
+                const stream = self.conn.stream orelse return error.NotConnected;
+                try self.outbox.push(self.allocator, payload);
+                self.outbox.flush(self.allocator, stream) catch {
+                    self.closed = true;
+                    return error.NotConnected;
+                };
+            }
+
+            /// Torn down by the next poll of this connection, once no poll of it is running.
+            fn closeErased(ptr: *anyopaque) void {
+                const self: *Connection = @ptrCast(@alignCast(ptr));
+                self.closed = true;
+            }
+
+            fn isConnectedErased(ptr: *anyopaque) bool {
+                const self: *Connection = @ptrCast(@alignCast(ptr));
+                return !self.closed;
+            }
+
+            fn destroy(self: *Connection) void {
+                if (self.removed) return;
+                self.closed = true;
+                if (self.depth > 0) {
+                    // A handler of this connection is on the stack, maybe waiting on the client: settle its
+                    // calls now, free the connection when the outermost poll returns
+                    if (self.peer) |peer| peer.stop();
+                    return;
+                }
+                self.removed = true;
+                self.server.removeConnection(self);
+
+                if (self.peer) |peer| {
+                    peer.stop();
+                    if (self.server.options.on_disconnect) |callback| {
+                        callback(&peer.state, .{ .peer = peer });
+                    }
+                    peer.destroy();
+                    self.peer = null;
+                }
+                self.server.retire(self.conn);
+                self.reader.deinit(self.allocator);
+                self.outbox.deinit(self.allocator);
+                self.allocator.destroy(self);
+            }
+
+            fn poll(self: *Connection) bool {
+                if (self.closed) {
+                    self.destroy();
+                    return true;
+                }
+                self.depth += 1;
+                const progressed = self.pollStream();
+                self.depth -= 1;
+                if (self.closed) {
+                    self.destroy();
+                    return true;
+                }
+                return progressed;
+            }
+
+            /// Any failure (refused hello or state, invalid frame or JSON, oversized frame, the client
+            /// gone) sets `closed`, like the WebSocket server dropping the socket.
+            fn pollStream(self: *Connection) bool {
+                if (!self.conn.acceptStreams()) {
+                    if (self.conn.isTerminated()) self.closed = true;
+                    return self.closed;
+                }
+                const stream = self.conn.stream.?;
+                self.outbox.flush(self.allocator, stream) catch {
+                    self.closed = true;
+                    return true;
+                };
+
+                var progressed = false;
+                while (!self.closed) {
+                    const space = self.reader.writable(self.allocator, quic_read_chunk) catch {
+                        self.closed = true;
+                        return true;
+                    };
+                    const n = quic_engine.read(stream, space) catch |err| switch (err) {
+                        error.WouldBlock => break,
+                        else => {
+                            self.closed = true;
+                            return true;
+                        },
+                    };
+                    self.reader.commit(n);
+                    progressed = true;
+                    while (!self.closed) {
+                        const payload = (self.reader.next() catch {
+                            self.closed = true;
+                            return true;
+                        }) orelse break;
+                        if (self.peer) |peer| {
+                            peer.handleIncomingFrame(payload, .text) catch {
+                                self.closed = true;
+                                return true;
+                            };
+                        } else {
+                            self.welcome(payload) catch {
+                                self.closed = true;
+                                return true;
+                            };
+                        }
+                    }
+                }
+                if (self.conn.isTerminated()) self.closed = true;
+                return progressed or self.closed;
+            }
+
+            /// The first frame: `{"hello": {...}}`, used like the WebSocket upgrade headers.
+            fn welcome(self: *Connection, payload: []const u8) !void {
+                var hello = try quic_frame.parseHello(self.allocator, payload);
+                defer hello.deinit(self.allocator);
+                const state = if (self.server.options.state) |make| try make(&hello.headers) else std.mem.zeroes(State);
+                const peer = try Peer(State).createTransported(self.allocator, self.server.channel, state, .quic_server, self, .{
+                    .send_frame = sendFrameErased,
+                    .close = closeErased,
+                    .is_connected = isConnectedErased,
+                });
+                self.peer = peer;
+                if (self.server.options.on_connect) |callback| {
+                    callback(&peer.state, .{ .peer = peer });
+                }
+            }
+        };
+
+        fn init(
+            self: *Self,
+            allocator: Allocator,
+            channel: *Channel(State),
+            target: ListenTarget,
+            options: QuicListenOptions(State),
+        ) !void {
+            const host = if (target.host.len >= 2 and target.host[0] == '[') target.host[1 .. target.host.len - 1] else target.host;
+            const address = try net.Address.parseIp(host, target.port);
+            var listener = try quic_engine.Listener.open(address, options.cert, options.key);
+            errdefer listener.deinit();
+            self.* = .{
+                .allocator = allocator,
+                .channel = channel,
+                .options = options,
+                .listener = listener,
+                .port_value = listener.port,
+            };
+            try registerPumpEntry(self, pollErased);
+        }
+
+        fn deinit(self: *Self, allocator: Allocator) void {
+            self.stop();
+            self.connections.deinit(allocator);
+            self.closing.deinit(allocator);
+        }
+
+        /// Drops every connection (each gets a CONNECTION_CLOSE) and closes the socket.
+        fn stop(self: *Self) void {
+            if (self.stopped) return;
+            self.stopped = true;
+            unregisterPumpEntry(self);
+            // Backwards: destroy swap-removes. One whose handler is running (stop called from it) stays.
+            var index = self.connections.items.len;
+            while (index > 0) {
+                index -= 1;
+                if (index < self.connections.items.len) self.connections.items[index].destroy();
+            }
+            var round: usize = 0;
+            while (self.closing.items.len > 0 and round < 5) : (round += 1) {
+                self.listener.tick();
+                self.reap();
+            }
+            for (self.closing.items) |*entry| entry.conn.deinit();
+            self.closing.clearRetainingCapacity();
+            self.listener_open = false;
+            self.listener.deinit();
+        }
+
+        fn retire(self: *Self, conn: quic_engine.ServerConn) void {
+            var mutable = conn;
+            // After stop the listener is gone and nothing would drive the shutdown
+            if (mutable.shutdown() or !self.listener_open) {
+                mutable.deinit();
+                return;
+            }
+            self.closing.append(self.allocator, .{
+                .conn = mutable,
+                .deadline_ms = std.time.milliTimestamp() + 2_000,
+            }) catch mutable.deinit();
+        }
+
+        fn reap(self: *Self) void {
+            const now = std.time.milliTimestamp();
+            var index: usize = 0;
+            while (index < self.closing.items.len) {
+                const entry = &self.closing.items[index];
+                if (entry.conn.shutdown() or entry.conn.isTerminated() or now > entry.deadline_ms) {
+                    entry.conn.deinit();
+                    _ = self.closing.swapRemove(index);
+                    continue;
+                }
+                index += 1;
+            }
+        }
+
+        fn pollErased(ptr: *anyopaque) !bool {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return self.poll();
+        }
+
+        fn poll(self: *Self) !bool {
+            if (self.stopped) return false;
+            self.listener.tick();
+
+            var progressed = false;
+            while (self.listener.accept()) |accepted| {
+                var conn = accepted;
+                const connection = self.allocator.create(Connection) catch {
+                    conn.deinit();
+                    break;
+                };
+                connection.* = .{
+                    .allocator = self.allocator,
+                    .server = self,
+                    .conn = conn,
+                };
+                self.connections.append(self.allocator, connection) catch {
+                    conn.deinit();
+                    self.allocator.destroy(connection);
+                    break;
+                };
+                progressed = true;
+            }
+
+            var index: usize = 0;
+            while (index < self.connections.items.len) {
+                const conn = self.connections.items[index];
+                // `conn` may be freed by `poll`, so check list membership instead of its fields
+                progressed = conn.poll() or progressed;
+                if (index < self.connections.items.len and self.connections.items[index] == conn) {
+                    index += 1;
+                }
+            }
+            if (self.stopped) return progressed;
+            self.reap();
+            return progressed;
+        }
+
+        fn removeConnection(self: *Self, target: *Connection) void {
+            for (self.connections.items, 0..) |item, index| {
+                if (item == target) {
                     _ = self.connections.swapRemove(index);
                     return;
                 }

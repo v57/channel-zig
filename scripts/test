@@ -38,6 +38,7 @@ start_fixture_if_needed() {
     return 0
   fi
   echo "Starting fixture server: $FIXTURE_DIR/tests/server.ts"
+  mkdir -p "$ROOT/coverage"
   (
     cd "$FIXTURE_DIR"
     bun tests/server.ts
@@ -64,5 +65,8 @@ start_fixture_if_needed
 
 "$ZIG" build test-unit
 "$ZIG" build test-integration
+# QUIC is opt-in (links the system OpenSSL 3.5+): unit tests again with it built in, then the QUIC suite,
+# whose interop tests use the fixture's QUIC server on UDP 2049 (CHANNEL_TEST_PORT) and bun
+"$ZIG" build test-unit test-quic -Dquic=true
 
 echo "All channel-zig tests passed."

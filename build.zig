@@ -9,12 +9,26 @@ pub fn build(b: *std.Build) void {
     });
     const websocket_module = websocket_dep.module("websocket");
 
+    // QUIC is opt-in: it links the system OpenSSL (3.5+, native QUIC API). The default build stays pure Zig.
+    const quic = b.option(bool, "quic", "Build the QUIC transport (links the system OpenSSL 3.5+)") orelse false;
+    const quic_engine = b.createModule(.{
+        .root_source_file = b.path(if (quic) "src/quic_openssl.zig" else "src/quic_disabled.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = if (quic) true else null,
+    });
+    if (quic) {
+        quic_engine.linkSystemLibrary("ssl", .{});
+        quic_engine.linkSystemLibrary("crypto", .{});
+    }
+
     const channel_module = b.addModule("channel", .{
         .root_source_file = b.path("src/channel.zig"),
         .target = target,
         .optimize = optimize,
     });
     channel_module.addImport("websocket", websocket_module);
+    channel_module.addImport("quic_engine", quic_engine);
 
     const lib = b.addLibrary(.{
         .linkage = .static,
@@ -54,6 +68,28 @@ pub fn build(b: *std.Build) void {
     const run_integration_tests = b.addRunArtifact(integration_tests);
     const test_integration_step = b.step("test-integration", "Run integration tests (requires TS fixture server)");
     test_integration_step.dependOn(&run_integration_tests.step);
+
+    // Needs -Dquic=true; scripts/test runs it
+    const quic_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/quic/quic_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "channel", .module = channel_module },
+            .{ .name = "quic_engine", .module = quic_engine },
+        },
+    });
+    const quic_tests = b.addTest(.{
+        .name = "test-quic",
+        .root_module = quic_test_module,
+    });
+    const run_quic_tests = b.addRunArtifact(quic_tests);
+    const test_quic_step = b.step("test-quic", "Run QUIC tests (needs -Dquic=true; interop with the TS fixture and bun)");
+    if (quic) {
+        test_quic_step.dependOn(&run_quic_tests.step);
+    } else {
+        test_quic_step.dependOn(&b.addFail("test-quic needs -Dquic=true").step);
+    }
 
     const bench_module = b.createModule(.{
         .root_source_file = b.path("bench/main.zig"),

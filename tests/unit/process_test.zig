@@ -804,3 +804,7 @@ test "subscription topic/body formatters and falsy bodies" {
     try events.rooms.send(testing.allocator, "b", 100); // other topic
     try testing.expectEqual(@as(i64, 12), sum);
 }
+
+test {
+    _ = @import("quic_frame_test.zig");
+}
